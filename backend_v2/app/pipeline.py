@@ -47,7 +47,7 @@ class PipelineConfig:
     extract_timeout: float = 20.0  # seconds for the claim-extraction LLM call
     claim_timeout: float = 30.0    # seconds per claim (retrieval + verdict)
     total_timeout: float = 45.0    # hard deadline for the whole request
-    expose_detail: bool = True     # include "Type: message" of errors in responses
+    expose_detail: bool = False    # opt in only for private debugging
 
 
 class TTLCache:
@@ -209,7 +209,7 @@ async def run_pipeline(
     # ---- 1. claim extraction ------------------------------------------------
     t = time.perf_counter()
     try:
-        extraction = await asyncio.wait_for(extract(text), cfg.extract_timeout)
+        extraction = await asyncio.wait_for(extract(text), min(cfg.extract_timeout, cfg.total_timeout))
     except asyncio.TimeoutError:
         raise PipelineError(
             "EXTRACTION_TIMEOUT", "İddialar ayrıştırılırken zaman aşımı oluştu.", http_status=504
@@ -266,7 +266,14 @@ async def run_pipeline(
     tasks = {asyncio.create_task(run_one(i, c)): (i, c) for i, c in to_run}
     if tasks:
         remaining = max(0.1, cfg.total_timeout - (time.perf_counter() - t_start))
-        done, pending = await asyncio.wait(tasks.keys(), timeout=remaining)
+        try:
+            done, pending = await asyncio.wait(tasks.keys(), timeout=remaining)
+        except asyncio.CancelledError:
+            # A disconnected SSE client must not leave claim coroutines running.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
         for task in pending:
             task.cancel()

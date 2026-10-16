@@ -516,6 +516,7 @@ def _search_web(
 
     results = []
     seen_urls = set()
+    successful_queries = 0
 
     for query in queries:
 
@@ -531,6 +532,10 @@ def _search_web(
 
         except Exception:
             continue
+
+        if not isinstance(response, dict) or not isinstance(response.get("results"), list):
+            continue
+        successful_queries += 1
 
         rows = (
             response.get(
@@ -1795,7 +1800,6 @@ def main():
 
         _run_self_tests()
 
-        return
 
     claim = " ".join(
         args.claim

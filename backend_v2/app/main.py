@@ -42,7 +42,17 @@ logging.basicConfig(
 log = logging.getLogger("verify.api")
 
 settings = Settings.from_env()
-state: dict = {"llm": None, "retriever": None, "cache": None, "init_error": None}
+state: dict = {"llm": None, "retriever": None, "cache": None, "init_error": None, "active": 0}
+
+
+def _admit():
+    # Single-process admission control; no queue of expensive provider calls.
+    if state["active"] >= 2:
+        return JSONResponse(status_code=429, headers={"Retry-After": "15"}, content={
+            "status": "error", "error": "BUSY", "message": "Sunucu meşgul. Biraz sonra yeniden deneyin."
+        })
+    state["active"] += 1
+    return None
 
 
 @asynccontextmanager
@@ -77,15 +87,17 @@ allowed_origins = [
     "http://localhost:3000",
     "http://localhost:5173",
 ]
-if settings.frontend_origin and settings.frontend_origin not in allowed_origins:
-    allowed_origins.append(settings.frontend_origin)
+for origin in settings.frontend_origin.split(","):
+    origin = origin.strip().rstrip("/")
+    if origin and origin not in allowed_origins:
+        allowed_origins.append(origin)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -112,14 +124,14 @@ def _not_ready():
             "status": "error",
             "error": "CONFIG_ERROR",
             "message": "Sunucu yapılandırması eksik.",
-            "detail": state["init_error"],
+            "detail": state["init_error"] if settings.pipeline.expose_detail else None,
         },
     )
 
 
 def _error_response(e: PipelineError):
     content = {"status": "error", "error": e.code, "message": e.message}
-    if e.detail:
+    if e.detail and settings.pipeline.expose_detail:
         content["detail"] = e.detail
     return JSONResponse(status_code=e.http_status, content=content)
 
@@ -147,7 +159,7 @@ def health():
         "status": "ok" if state["init_error"] is None else "degraded",
         "service": "verify-backend",
         "version": "2.0.0",
-        "init_error": state["init_error"],
+        "init_error": state["init_error"] if settings.pipeline.expose_detail else None,
         "config": {
             "model": settings.model_name,
             "reasoning_effort": settings.reasoning_effort or None,
@@ -165,6 +177,9 @@ def health():
 
 @app.get("/health/deep")
 async def health_deep():
+    # This diagnostic endpoint spends provider credits; explicitly enable for debugging.
+    if not settings.pipeline.expose_detail:
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
     if state["init_error"]:
         return _not_ready()
 
@@ -204,6 +219,9 @@ async def verify(request: VerifyRequest):
             },
         )
 
+    busy = _admit()
+    if busy is not None:
+        return busy
     try:
         return await _run(text)
     except PipelineError as e:
@@ -219,6 +237,8 @@ async def verify(request: VerifyRequest):
                 "detail": f"{type(exc).__name__}: {exc}"[:300] if settings.pipeline.expose_detail else None,
             },
         )
+    finally:
+        state["active"] -= 1
 
 
 @app.post("/verify/stream")
@@ -227,6 +247,13 @@ async def verify_stream(request: VerifyRequest):
         return _not_ready()
 
     text = request.text.strip()
+    if not text:
+        return JSONResponse(status_code=400, content={
+            "status": "error", "error": "EMPTY_TEXT", "message": "Doğrulanacak metin boş olamaz."
+        })
+    busy = _admit()
+    if busy is not None:
+        return busy
     queue: asyncio.Queue = asyncio.Queue()
 
     async def emit(event: dict):
@@ -237,12 +264,13 @@ async def verify_stream(request: VerifyRequest):
             res = await _run(text, emit=emit)
             await queue.put({"type": "done", "partial": res["partial"], "timings": res["timings"]})
         except PipelineError as e:
-            await queue.put({"type": "error", "error": e.code, "message": e.message, "detail": e.detail})
+            await queue.put({"type": "error", "error": e.code, "message": e.message,
+                             "detail": e.detail if settings.pipeline.expose_detail else None})
         except Exception as exc:
             log.exception("unexpected failure in /verify/stream")
             await queue.put(
                 {"type": "error", "error": "VERIFY_FAILED", "message": "Doğrulama işlemi sırasında bir hata oluştu.",
-                 "detail": f"{type(exc).__name__}: {exc}"[:300]}
+                 "detail": f"{type(exc).__name__}: {exc}"[:300] if settings.pipeline.expose_detail else None}
             )
         finally:
             await queue.put(None)
@@ -262,6 +290,8 @@ async def verify_stream(request: VerifyRequest):
                 yield f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
         finally:
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            state["active"] -= 1
 
     return StreamingResponse(
         gen(),
