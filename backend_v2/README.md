@@ -1,78 +1,122 @@
-# backend_v2
+# Verify backend v2
 
-A from-scratch rewrite of `backend/`, built to be **fast, observable, and impossible to hang**.
-The old `backend/` is untouched, so the two can be compared side by side.
+`POST /verify` ve `POST /verify/stream` JSON/SSE sözleşmelerini korur.
+`GET /health` sağlayıcı çağırmayan liveness kontrolüdür; HTTP 200 içindeki
+`status=degraded` yapılandırmanın hazır olmadığını belirtir. Gerçek sağlayıcı
+başarısını kanıtlamaz. İç başlangıç hataları yayınlanmaz. `/health/deep` her
+ortamda 404; üretimde `/docs`, `/redoc`, `/openapi.json` kapalıdır.
 
-## What is different
+## Yerel çalıştırma ve test
 
-| Old backend | backend_v2 |
-|---|---|
-| Claims processed one after another | Claims run concurrently (`CLAIM_CONCURRENCY`) |
-| Up to 5 searches + 12 page downloads + a Chromium launch per page, per claim | Arda's new `retrieval_demo_lite` (3 searches, 8 plain page downloads, no browser, no ML models), with the downloads run **in parallel** |
-| torch + sentence-transformers + Chromium in the image (~2 GB+) | Only `fastapi`, `groq`, `tavily-python` |
-| No time limit: a slow request just dies at the frontend's timeout | Hard deadline (`TOTAL_TIMEOUT`): always answers, with partial results if needed |
-| Any error becomes the same generic 500 | Each claim reports its own `status`, `error_code`, `failed_stage`, and (optionally) `detail` |
-| Missing API key crashes the server at startup | Server starts, `/health` and `/verify` say exactly which variable is missing |
-| gpt-oss "thinks" at default effort | `reasoning_effort=low` (auto-disabled if Groq rejects it) |
-| Same claim re-researched every time | In-memory cache (6 h), Turkish-aware key |
-| No way to see what is slow | `timings` in every response + `/health/deep` |
-
-`ai-engine/ai_engine.py` and `retrieval_demo_lite/search_retrieval_lite.py` are reused as-is (imported, never copied
-or edited), so there is one copy of the prompts and one copy of the retrieval logic, and `git pull` never conflicts.
-
-The lite module downloads its pages one after another; `LiteRetriever` (in `app/retrieval.py`) wraps two of its
-internal functions so they run in parallel (4.1 s -> 0.5 s in a simulated test, same sources chosen). If Arda later
-parallelises the module himself, that wrapper can simply be deleted.
-
-## Run locally (Windows)
+Repo kökünde, tercihen ayrı venv içinde:
 
 ```powershell
-cd C:\Users\Mert\Desktop\verify
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r backend_v2\requirements.txt
-copy backend_v2\.env.example backend_v2\.env     # then fill in the two keys
+python -m pip install -r backend_v2/requirements-test.txt
+python -m pytest backend_v2/tests -q
 cd backend_v2
-uvicorn app.main:app --reload
+uvicorn app.main:app --workers 1 --no-proxy-headers --no-access-log
 ```
 
-Then open <http://localhost:8000/health/deep>. It makes one tiny real call to Groq and to Tavily and
-tells you how long each took, or the exact error. **If something is wrong, start there.**
+`.env.example` şablondur; anahtarları yerel ortamdan sağlayın, Git'e eklemeyin.
+Testler mock kullanır; yeni HTTP testleri dış socket bağlantısını da engeller.
+Windows asyncio iç loopback socketpair bağlantısına izin verilir.
+API hata ayrıntısı her ortamda kapalıdır; `EXPOSE_ERROR_DETAIL` public API'de
+artık etkili değildir. AI/retrieval/pipeline mantığı değiştirilmemiştir.
 
-Tests (no network, no keys needed): `python tests/test_pipeline.py`
+## Kapasite ve güvenlik
 
-## API
+- `MAX_ACTIVE_VERIFICATIONS=2`: endpoint'ler ortak kapasite kullanır. Doluysa
+  429 `BUSY`, `Retry-After: 1`. Hata/timeout/disconnect sonrasında çalışan sync
+  thread varsa gerçekten bitene kadar slot tutulur. Lifespan'da kurulan
+  `TrackingExecutor`, mevcut adapter `asyncio.to_thread` çağrılarını izler.
+- `MAX_BACKGROUND_THREADS=8` dış executor sınırıdır; retrieval iç havuzları
+  nedeniyle toplam thread sayısına hard limit değildir. İç havuzların kapanmasını
+  dış thread bekler. Takılan thread zorla öldürülmez, slotu tutmaya devam eder.
+- `MAX_RSS_MB=384`: kabul anındaki RSS yüksekse veya ölçülemiyorsa 503
+  `LOW_MEMORY`, `Retry-After: 30`. Bu işletim sistemi RAM sınırı değildir;
+  devam eden işin ani bellek artışı OOM oluşturabilir. Container limiti ve gerçek
+  yük testi ayrıca gerekir. Loglarda RSS ve OS process peak MiB ölçülür.
+- Ortak IP kotaları: `RATE_LIMIT_PER_MINUTE=10`, `HOURLY_QUOTA=100`,
+  `DAILY_QUOTA=500`; süreç geneli `GLOBAL_DAILY_QUOTA=1000`. UTC epoch tabanlı
+  sabit pencere kullanılır; sınırda iki kat burst mümkündür. Red yanıtı 429
+  `RATE_LIMITED`, `Retry-After` kalan pencere süresidir. Hatalı/BUSY denemeleri
+  kota tüketir. İstek sayısı token veya kredi bütçesi değildir.
+- `MAX_TRACKED_CLIENTS=10000`: tablo dolunca yeni IP fail-closed reddedilir.
+  Sayaçlar yeniden başlamada sıfırlanır. **Çoklu worker/replica ortak sayaç
+  tutmaz**; kapasite ve kota süreç başınadır. Ölçekleme için ortak atomik
+  sayaç deposu gerekir; bu çalışma onu eklemez. Tek worker kullanın.
+- Gövde Content-Length'e güvenilmeden, chunked dahil 65536 byte ile sınırlıdır.
+  Ingress slow-client/bağlantı limitleri ayrıca yapılandırılmalıdır.
+- `TRUSTED_PROXY_CIDRS` boşsa X-Forwarded-For yok sayılır. Doğrudan peer
+  güvenilir ise zincirde sağdan sola ilk güvenilmeyen IP kullanılır. Uvicorn
+  proxy dönüşümü kapalı kalmalıdır. Render ingress CIDR ve header temizleme
+  davranışını doğrulamadan geniş CIDR eklemeyin. Aksi halde spoofing veya tüm
+  kullanıcıların tek kotaya düşmesi mümkündür. NAT kullanıcıları kotayı paylaşır.
+- `CORS_ORIGINS` virgülle ayrılmış tam origin listesidir; üretim yalnız HTTPS
+  kabul eder. CORS kimlik doğrulama değildir. `X-Request-ID` sunucuda üretilir;
+  istemci değeri kullanılmaz. CORS expose headers: `X-Request-ID`, `Retry-After`.
+- Güvenli loglar ID, durum, RSS, peak ve aktif sayısını içerir; gövde, IP,
+  query, anahtar ve traceback içermez. Eski adapter logları merkezi filtreyle
+  genel mesaja dönüştürülür; HTTP URL erişim logları kapatılır.
 
-- `GET /health` – config and which keys are set (never the keys)
-- `GET /health/deep` – live latency / error check of Groq and Tavily
-- `POST /verify` `{"text": "..."}` – same shape as before. New fields: `partial`, `timings`, and per claim
-  `status` (`ok` | `error` | `timeout` | `skipped`), `error_code`, `failed_stage`, `detail`, `cached`, `timings_ms`.
-  A claim with `status != "ok"` has `verdict: null`, so the frontend must not show it as a real verdict.
-- `POST /verify/stream` – Server-Sent Events: `claims` (immediately), one `result` per claim as it finishes,
-  then `done`. Lets the UI show claims and verdicts as they arrive instead of one long spinner.
-  (Use `fetch` + a stream reader on the frontend; `EventSource` cannot POST.)
+## Docker ve Render — canlıya uygulanmadı
 
-## Choosing the retriever (`RETRIEVER` in `.env`)
+```powershell
+docker build -f backend_v2/Dockerfile -t verify-backend .
+docker run --rm -p 8000:8000 --memory=512m --env-file backend_v2/.env verify-backend
+```
 
-| Value | What it is | Speed | Needs |
-|---|---|---|---|
-| `lite` (default) | Arda's `retrieval_demo_lite` | medium | `requests`, `beautifulsoup4` |
-| `tavily` | one Tavily search, uses its snippets only | fastest, thinnest evidence | nothing extra |
-| `arda` | Arda's old heavy pipeline (embeddings + cross-encoder + browser) | slowest | torch, sentence-transformers, ... |
+Context repo kökü, Dockerfile `backend_v2/Dockerfile`. Dockerfile'a özgü ignore
+dosyası `.env`, Git ve yerel bağımlılıkları dışlar. UID 10001 ve HEALTHCHECK
+eklenmiştir. Doğrudan Python bağımlılıkları yereldeki sürümlere sabitlenmiştir;
+transitif bağımlılıkların tamamı kilitli değildir. Docker Python 3.12 kullanır;
+yerel Python farklı olduğundan container build ve smoke testi ayrıca gereklidir.
 
-Run the same texts with different values and compare `timings` and the sources. For `lite`, `LITE_QUERY_COUNT=2`
-is the easiest extra speed-up (see `.env.example`).
+`backend_v2/render.yaml` Blueprint taslağıdır. Blueprint Path bu dosya, repo
+`MertBulut11/verify-v2`, branch `fatih/api-security`. Root Directory boş,
+Docker Context `.`, Dockerfile Path `backend_v2/Dockerfile`, Health Check
+`/health`. Otomatik deploy kapalıdır. Mevcut servise uygulamadan önce taslağın
+yeni servis oluşturmadığını kontrol edin. Anahtarları panelde secret ortam
+değişkeni olarak girin. Gerçek frontend origin ve doğrulanmış ingress CIDR gerekir.
+Panelde değişiklik yapılmadı; Git gönderimi/deploy öncesi açık onay gereklidir.
 
-## Deploying
+Cold-start: offline stub sağlayıcılarla container başlatıp başlangıçtan ilk health
+200'e süreyi ve ilk mock verify süresini ayrı ölçün. Onaylı Render deploy sonrası
+pasif durumdan ilk health yanıtına en az 5 ölçüm alın; medyan/p95, plan, commit,
+RSS/peak kaydedin. Health kredisi tüketmez; gerçek verify için ayrıca onay gerekir.
+Bu çalışma canlı cold-start sonucu iddia etmez.
 
-Make sure `retrieval_demo_lite/` is committed (the image copies it). Build from the **repo root**: `docker build -f backend_v2/Dockerfile -t verify-backend .`
-On Render/Railway: Dockerfile path `backend_v2/Dockerfile`, build context = repository root, and set
-`GROQ_API_KEY` and `TAVILY_API_KEY` in the dashboard. Set `EXPOSE_ERROR_DETAIL=0` once things are stable.
+Rollback: mevcut başarılı deploy ID/commit ve secretsiz ayar envanterini kaydedin.
+Onay sonrası Render Events'ten önceki başarılı deploy'a dönün; health, CORS ve
+endpoint gizliliğini kontrol edin. Ortam ayarlarının otomatik döndüğünü
+varsaymayın, ayrı doğrulayın. Otomatik deploy kapalı kalsın.
+[Docker](https://render.com/docs/docker),
+[Blueprint](https://render.com/docs/blueprint-spec),
+[Rollback](https://render.com/docs/rollbacks).
 
-## Known limits
+## Groq ve Tavily bütçe işlemleri — hesap değişikliği yapılmadı
 
-- The cache and rate-limiting are per process (fine for one instance; use Redis if you scale out).
-- Python threads that are already waiting on Groq/Tavily when a request times out cannot be killed; their
-  result is simply discarded.
-- With `RETRIEVER=tavily`, Tavily snippets are shorter than full pages, so evidence is thinner (speed/depth trade-off).
-- The lite module still runs its 3 Tavily searches one after another (about 1-2 s each).
+Groq [Spend Limits](https://console.groq.com/docs/spend-limits): ücretli katmanda
+organization owner aylık ortak harcama limiti/uyarı ayarlayabilir. Takip 10–15
+dakika gecikebilir; sıfır aşım garantisi değildir. Günlük/haftalık veya API
+anahtarı başına harcama sınırı varsaymayın. Bu özellik için ücretsiz hesabı
+yükseltmeyin. [Rate limits](https://console.groq.com/docs/rate-limits) token/istek
+sınırıdır, harcama limiti değildir. Hesap sahibi mevcut ücretsiz limitleri ve
+kullanım ekranını kontrol etmelidir.
+
+Tavily [resmi PAYG rehberi](https://help.tavily.com/articles/8280756099-how-to-set-a-limit-for-pay-as-you-go-option)
+plan ayarlarında aylık kullanım limiti ve limite yaklaşma/aşma bildirimlerini
+anlatır. Ücretsiz hesapta özel USD eşikleri veya gecikmesiz hard stop olduğunu
+varsaymayın. [Dashboard](https://help.tavily.com/articles/7015474742-tavily-usage-dashboard)
+üzerinden tüketimi izleyin. PAYG/otomatik ek kredi etkinleştirmeyin.
+Hesapların mevcut plan/özellikleri doğrulanmadı. Gerçek limit/uyarı değişikliği
+için hesap sahibi onayı gerekir. Uygulama kotası diğer uygulamaların aynı
+organization/anahtar harcamalarını kapsamaz.
+
+## Ekip entegrasyon notu
+
+`llm.py` ve `retrieval.py` değiştirilmedi. Mevcut `asyncio.to_thread` executor
+entegrasyonu ile çalışır. Ayrı executor veya fire-and-forget işe geçilirse
+thread yaşam döngüsü yeniden entegre/test edilmelidir. Mert'in reasoning fallback
+logundaki exception içeriği merkezi filtreyle gizlenir; ileride o satırın yerinde
+temizlenmesi önerilir. Arda'nın iç thread havuzları dış çağrı bitmeden kapanmalıdır.

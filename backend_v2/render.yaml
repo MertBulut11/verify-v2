@@ -1,0 +1,27 @@
+# Select backend_v2/render.yaml as Blueprint Path. Do not auto-apply.
+services:
+  - type: web
+    name: verify-backend
+    runtime: docker
+    repo: https://github.com/MertBulut11/verify-v2
+    branch: fatih/api-security
+    plan: free
+    autoDeployTrigger: "off"
+    dockerContext: .
+    dockerfilePath: backend_v2/Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: MAX_ACTIVE_VERIFICATIONS
+        value: "2"
+      - key: MAX_RSS_MB
+        value: "384"
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: TRUSTED_PROXY_CIDRS
+        sync: false
