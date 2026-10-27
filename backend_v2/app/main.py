@@ -3,10 +3,8 @@ Verify backend v2.
 
 Endpoints
   GET  /              liveness
-  GET  /health        config + which keys are set (never the keys themselves)
-  GET  /health/deep   makes one tiny real call to Groq and to the search
-                      provider and reports latency / errors for each.
-                      -> run this first when "something is wrong"
+  GET  /health        lightweight liveness and safe readiness summary
+  GET  /health/deep   disabled (404); never makes paid provider calls
   POST /verify        same request/response shape as the old backend, plus
                       per-claim `status`, `timings`, and `partial`.
                       Always answers within TOTAL_TIMEOUT seconds.
@@ -20,7 +18,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -29,29 +26,43 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException
 
 load_dotenv()
 
 from .config import Settings  # noqa: E402
 from .pipeline import PipelineError, TTLCache, run_pipeline  # noqa: E402
+from .security import Guard, SecurityMiddleware, RequestIDMiddleware, error
+from .resources import TrackingExecutor, positive_env
+from .safe_logging import install_safe_logging
+
+install_safe_logging()
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level={"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
+           "ERROR": logging.ERROR}.get(os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+install_safe_logging()
 log = logging.getLogger("verify.api")
 
 settings = Settings.from_env()
+production = os.getenv("APP_ENV", "production").strip().lower() not in {"development", "test"}
+guard = Guard()
 state: dict = {"llm": None, "retriever": None, "cache": None, "init_error": None}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    asyncio.get_running_loop().set_default_executor(
+        TrackingExecutor(max_workers=positive_env("MAX_BACKGROUND_THREADS", 8))
+    )
+    state.update(llm=None, retriever=None, cache=None, init_error=None)
     # A missing key must NOT crash the server: it should start and say what is wrong.
     missing = settings.missing()
     if missing:
         state["init_error"] = "Eksik ortam değişkenleri: " + ", ".join(missing)
-        log.error("startup: %s", state["init_error"])
+        log.error("startup configuration unavailable")
     else:
         try:
             from .llm import LLM
@@ -60,17 +71,19 @@ async def lifespan(app: FastAPI):
             state["llm"] = LLM(settings)
             state["retriever"] = build_retriever(settings)
             state["cache"] = TTLCache(ttl=settings.cache_ttl)
-            log.info(
-                "ready: model=%s retriever=%s reasoning=%s",
-                settings.model_name, settings.retriever, settings.reasoning_effort or "default",
-            )
-        except Exception as exc:
-            state["init_error"] = f"{type(exc).__name__}: {exc}"
-            log.exception("startup failed")
+            log.info("startup ready")
+        except Exception:
+            state["init_error"] = "initialization failed"
+            log.error("startup initialization failed")
     yield
 
 
-app = FastAPI(title="Verify Backend", version="2.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Verify Backend", version="2.0.0", lifespan=lifespan,
+    docs_url=None if production else "/docs",
+    redoc_url=None if production else "/redoc",
+    openapi_url=None if production else "/openapi.json",
+)
 
 allowed_origins = [
     "https://verify-test-swart.vercel.app",
@@ -79,6 +92,12 @@ allowed_origins = [
 ]
 if settings.frontend_origin and settings.frontend_origin not in allowed_origins:
     allowed_origins.append(settings.frontend_origin)
+if os.getenv("CORS_ORIGINS"):
+    allowed_origins = [value.strip() for value in os.environ["CORS_ORIGINS"].split(",") if value.strip()]
+if production:
+    allowed_origins = [value for value in allowed_origins if value.startswith("https://") and "*" not in value]
+
+app.add_middleware(SecurityMiddleware, guard=guard)
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,7 +105,14 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "Retry-After"],
 )
+app.add_middleware(RequestIDMiddleware)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return error("HTTP_ERROR", exc.status_code)
 
 
 class VerifyRequest(BaseModel):
@@ -112,15 +138,12 @@ def _not_ready():
             "status": "error",
             "error": "CONFIG_ERROR",
             "message": "Sunucu yapılandırması eksik.",
-            "detail": state["init_error"],
         },
     )
 
 
 def _error_response(e: PipelineError):
-    content = {"status": "error", "error": e.code, "message": e.message}
-    if e.detail:
-        content["detail"] = e.detail
+    content = {"status": "error", "error": e.code, "message": "Doğrulama tamamlanamadı."}
     return JSONResponse(status_code=e.http_status, content=content)
 
 
@@ -147,7 +170,6 @@ def health():
         "status": "ok" if state["init_error"] is None else "degraded",
         "service": "verify-backend",
         "version": "2.0.0",
-        "init_error": state["init_error"],
         "config": {
             "model": settings.model_name,
             "reasoning_effort": settings.reasoning_effort or None,
@@ -163,29 +185,9 @@ def health():
     }
 
 
-@app.get("/health/deep")
+@app.get("/health/deep", include_in_schema=False)
 async def health_deep():
-    if state["init_error"]:
-        return _not_ready()
-
-    async def timed(coro):
-        t = time.perf_counter()
-        try:
-            await coro
-            return {"ok": True, "ms": int((time.perf_counter() - t) * 1000)}
-        except Exception as exc:
-            return {
-                "ok": False,
-                "ms": int((time.perf_counter() - t) * 1000),
-                "error": f"{type(exc).__name__}: {exc}"[:300],
-            }
-
-    claim = "Ankara Türkiye'nin başkentidir."
-    llm_check, search_check = await asyncio.gather(
-        timed(state["llm"].extract(claim)),
-        timed(state["retriever"](claim)),
-    )
-    return {"llm": llm_check, "search": search_check}
+    return error("HTTP_ERROR", 404)
 
 
 @app.post("/verify")
@@ -208,15 +210,14 @@ async def verify(request: VerifyRequest):
         return await _run(text)
     except PipelineError as e:
         return _error_response(e)
-    except Exception as exc:
-        log.exception("unexpected failure in /verify")
+    except Exception:
+        log.error("verification failed")
         return JSONResponse(
             status_code=500,
             content={
                 "status": "error",
                 "error": "VERIFY_FAILED",
                 "message": "Doğrulama işlemi sırasında bir hata oluştu.",
-                "detail": f"{type(exc).__name__}: {exc}"[:300] if settings.pipeline.expose_detail else None,
             },
         )
 
@@ -227,7 +228,9 @@ async def verify_stream(request: VerifyRequest):
         return _not_ready()
 
     text = request.text.strip()
-    queue: asyncio.Queue = asyncio.Queue()
+    if not text:
+        return error("EMPTY_TEXT", 400)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
 
     async def emit(event: dict):
         await queue.put(event)
@@ -237,15 +240,16 @@ async def verify_stream(request: VerifyRequest):
             res = await _run(text, emit=emit)
             await queue.put({"type": "done", "partial": res["partial"], "timings": res["timings"]})
         except PipelineError as e:
-            await queue.put({"type": "error", "error": e.code, "message": e.message, "detail": e.detail})
-        except Exception as exc:
-            log.exception("unexpected failure in /verify/stream")
+            await queue.put({"type": "error", "error": e.code, "message": "Doğrulama tamamlanamadı."})
+        except Exception:
+            log.error("stream verification failed")
             await queue.put(
                 {"type": "error", "error": "VERIFY_FAILED", "message": "Doğrulama işlemi sırasında bir hata oluştu.",
-                 "detail": f"{type(exc).__name__}: {exc}"[:300]}
+                 }
             )
         finally:
-            await queue.put(None)
+            if not asyncio.current_task().cancelling():
+                await queue.put(None)
 
     task = asyncio.create_task(runner())
 
@@ -262,6 +266,7 @@ async def verify_stream(request: VerifyRequest):
                 yield f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
         finally:
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     return StreamingResponse(
         gen(),
